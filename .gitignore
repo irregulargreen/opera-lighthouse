@@ -1,0 +1,32 @@
+# Secrets — NEVER commit
+.env
+
+# ML model files (large binaries, machine-specific)
+logs/
+*.pkl
+*.db
+*.sqlite
+*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
