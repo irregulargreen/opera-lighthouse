@@ -1,412 +1,554 @@
 """
-main.py — the main bot loop.
+main.py — the trading bot loop.
 
-Pipeline:
-  Every SCAN_INTERVAL_SECONDS:
-    1. Fetch new markets (high-priority, first-mover window)
-    2. Enrich with news
-    3. LLM estimate
-    4. Calculate edge
-    5. Execute if edge > threshold
+Pipeline per cycle:
+  1. Fetch candles for all instruments × primary + H4 timeframes
+  2. Compute indicators → extract features → classify regime
+  3. Compute cross-pair features (USD strength, volatility sync)
+  4. Add higher-timeframe bias to features
+  5. Run all strategies → collect signals
+  6. ML signal combiner ranks and filters signals
+  7. Risk manager approves/blocks
+  8. Position sizer determines units
+  9. Executor places trades
+ 10. Check for closed positions → feed outcomes back to ML
 
-  Every FULL_SWEEP_INTERVAL_SECONDS:
-    Same pipeline but on ALL active markets in the "sweet spot" liquidity band
-
-  On startup: print current stats from calibration DB
+The system starts conservative (heuristic-only) and gets sharper
+as resolved trades accumulate and the ML models activate.
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
 import signal
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
 
+import numpy as np
 from loguru import logger
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from rich import print as rprint
+
+LOG_DIR = Path(__file__).parent / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+
+logger.add(
+    LOG_DIR / "bot_{time:YYYY-MM-DD}.log",
+    rotation="00:00",
+    retention="30 days",
+    compression="gz",
+    format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {message}",
+    level="DEBUG",
+    enqueue=True,
+)
 
 from core.config import config
-from core.models import EnrichedMarket, TradeSignal
-from data.scanner import MarketScanner
-from data.news_enricher import NewsEnricher
-from strategies.tiered_forecaster import TieredForecaster
-from strategies.edge_calculator import EdgeCalculator
-from strategies.executor import Executor
-from utils.calibration import CalibrationTracker
-from utils.ml_market_classifier import MarketClassifier
-from utils.meta_learner import MetaLearner
-
+from core.models import Direction, PriceSeries, Regime, Signal
+from data.feature_engine import FeatureEngine
+from data.market_data import OANDAClient
+from data.store import TradeStore
+from execution.executor import Executor
+from execution.risk_manager import RiskManager
+from ml.position_sizer import PositionSizer
+from ml.regime_detector import RegimeDetector
+from ml.signal_combiner import SignalCombiner
+from strategies.breakout import Breakout
+from strategies.mean_reversion import MeanReversion
+from strategies.trend_following import TrendFollowing
 
 console = Console()
 
 
-class PolymarketBot:
-    """
-    Full AI-powered Polymarket scanning and trading bot.
-    Combines: market discovery → news enrichment → LLM forecasting →
-              edge calculation → execution → calibration tracking.
-    """
+class TradingBot:
 
-    def __init__(self):
-        self.scanner = MarketScanner()
-        self.enricher = NewsEnricher()
-        self.forecaster = TieredForecaster()
-        self.edge_calc = EdgeCalculator()
-        self.executor = Executor()
-        self.calibration = CalibrationTracker()
-        self.market_classifier = MarketClassifier(min_edge=config.bot.min_edge)
-        self.meta_learner = MetaLearner()
+    def __init__(self, instrument_filter: str | None = None):
+        self.oanda = OANDAClient()
+        self.features = FeatureEngine()
+        self.risk = RiskManager()
+
+        self.strategies = [
+            TrendFollowing(),
+            MeanReversion(),
+            Breakout(),
+        ]
+
         self._running = False
-        self._last_full_sweep = datetime.min
-        self._processed_market_ids: set[str] = set()  # Avoid re-processing
+        self._cycle_count = 0
+        self._last_regime_label_time: dict[str, datetime] = {}
 
-    # ─── Startup ──────────────────────────────────────────────────────────────
+        # Per-instrument mode
+        self._instrument_filter = instrument_filter
+        if instrument_filter:
+            self._instruments = [instrument_filter]
+            suffix = f"_{instrument_filter}"
+        else:
+            self._instruments = config.trading.instruments
+            suffix = ""
+
+        # ML + persistence paths scoped by mode
+        self.store = TradeStore(suffix=suffix)
+        self.executor = Executor(self.store, self.oanda)
+        self.regime_detector = RegimeDetector(suffix=suffix)
+        self.signal_combiner = SignalCombiner(suffix=suffix)
+        self.sizer = PositionSizer()
+
+        # Cross-pair data cache (populated each cycle)
+        self._pair_returns: dict[str, float] = {}
+        self._pair_atr_ratios: dict[str, float] = {}
 
     async def start(self):
-        """Initialise components and start the main loop."""
-        console.print(Panel.fit(
-            "[bold green]Polymarket AI Scanner[/bold green]\n"
-            "[dim]LLM-powered edge detection across prediction markets[/dim]",
-            border_style="green",
-        ))
+        self._print_startup()
 
-        mode = "[yellow]DRY RUN[/yellow]" if config.bot.dry_run else "[red bold]LIVE TRADING[/red bold]"
-        console.print(f"Mode: {mode}")
-        console.print(f"Min edge: [cyan]{config.bot.min_edge:.1%}[/cyan]")
-        console.print(f"Max trade: [cyan]${config.bot.max_trade_size_usdc:.2f}[/cyan]")
-        console.print(f"Capital: [cyan]${config.bot.total_capital_usdc:.2f}[/cyan]")
-        console.print(f"Kelly fraction: [cyan]{config.bot.kelly_fraction:.0%}[/cyan]")
-
-        # Show enabled LLMs
-        llms = []
-        if config.llm.openai_enabled:
-            llms.append("OpenAI GPT-4o")
-        if config.llm.anthropic_enabled:
-            llms.append("Claude Sonnet")
-        if config.llm.ollama_enabled:
-            llms.append(f"Ollama ({config.llm.ollama_model})")
-        console.print(f"LLMs: [cyan]{', '.join(llms) or 'None configured!'}[/cyan]\n")
-
-        if not llms:
-            logger.error("No LLM providers configured! Set API keys in .env")
+        if not config.oanda.is_configured:
+            logger.error("OANDA API not configured. Set OANDA_API_KEY and OANDA_ACCOUNT_ID in .env")
             sys.exit(1)
 
-        # Show ML status
-        ml_report = self.forecaster.get_ml_calibration_report()
-        ml_status = f"[cyan]{ml_report['status']}[/cyan] ({ml_report['total_samples']} samples)"
-        if ml_report['total_samples'] < 30:
-            ml_status += f" [dim]— need {30 - ml_report['total_samples']} more resolved trades[/dim]"
-        console.print(f"ML calibration: {ml_status}")
-
-        clf_status = "fitted" if self.market_classifier._is_fitted else f"heuristic ({len(self.market_classifier._training_data)} samples)"
-        console.print(f"Market classifier: [cyan]{clf_status}[/cyan]")
-
-        meta_insights = self.meta_learner.get_insights()
-        meta_status = (
-            f"[cyan]{meta_insights['status']}[/cyan] "
-            f"({meta_insights['total_resolved_trades']} resolved trades"
-            + (f", AUC={meta_insights['model_auc']:.3f}" if meta_insights.get('model_auc') else "")
-            + ")"
-        )
-        console.print(f"Meta-learner:     {meta_status}\n")
-
-        # Initialise executor (connects to Polymarket CLOB)
-        self.executor.initialise()
-
-        # Register shutdown handler
         for sig in (signal.SIGINT, signal.SIGTERM):
-            signal.signal(sig, self._handle_shutdown)
+            signal.signal(sig, self._shutdown)
 
         self._running = True
-        await self._main_loop()
+        await self._loop()
 
-    # ─── Main loop ────────────────────────────────────────────────────────────
+    # ── Main Loop ────────────────────────────────────────────────────────────
 
-    async def _main_loop(self):
-        async with self.scanner as scanner, self.enricher as enricher:
-            self.scanner = scanner
-            self.enricher = enricher
+    async def _loop(self):
+        while self._running:
+            cycle_start = datetime.now(timezone.utc)
+            self._cycle_count += 1
 
-            while self._running:
-                now = datetime.utcnow()
-                cycle_start = datetime.utcnow()
+            try:
+                logger.info(f"{'=' * 60}")
+                logger.info(f"[Bot] Cycle {self._cycle_count} @ {cycle_start.strftime('%H:%M:%S UTC')}")
 
-                try:
-                    # ── New market sweep (every SCAN_INTERVAL_SECONDS) ────────
-                    logger.info("=" * 60)
-                    logger.info(f"[Loop] New market scan @ {now.strftime('%H:%M:%S')}")
+                if config.trading.dry_run:
+                    prices = {}
+                    for inst in self._instruments:
+                        try:
+                            prices[inst] = await self.oanda.get_current_price(inst)
+                        except Exception:
+                            pass
+                    await self.executor.check_dry_run_exits(prices)
+                else:
+                    await self.executor.sync_open_trades()
 
-                    new_markets = await self.scanner.get_new_markets()
-                    fresh = [m for m in new_markets if m.question_id not in self._processed_market_ids]
+                self._process_closed_trades()
 
-                    if fresh:
-                        logger.info(f"[Loop] {len(fresh)} fresh markets to analyse")
-                        await self._process_markets(fresh, priority="NEW")
-                    else:
-                        logger.info("[Loop] No new markets since last scan")
+                # Phase 1: fetch data and compute features for ALL instruments
+                instrument_data: dict[str, dict] = {}
+                for instrument in self._instruments:
+                    data = await self._fetch_instrument_data(instrument)
+                    if data:
+                        instrument_data[instrument] = data
 
-                    # ── Full sweep (every FULL_SWEEP_INTERVAL_SECONDS) ────────
-                    seconds_since_sweep = (now - self._last_full_sweep).total_seconds()
-                    if seconds_since_sweep >= config.bot.full_sweep_interval_seconds:
-                        logger.info(f"[Loop] Full market sweep")
-                        active = await self.scanner.get_active_markets(
-                            min_volume_24h=500.0,
-                            min_liquidity=config.bot.min_liquidity_usdc,
-                            limit=300,
-                        )
-                        # Exclude markets already processed in recent history
-                        to_process = [m for m in active if m.question_id not in self._processed_market_ids]
-                        logger.info(f"[Loop] Full sweep: {len(to_process)} markets to analyse")
+                # Phase 2: compute cross-pair features
+                cross_features = self._compute_cross_pair_features(instrument_data)
 
-                        if to_process:
-                            # Enrich order books concurrently before LLM evaluation
-                            to_process = await self.scanner.enrich_with_order_books(to_process)
-                            await self._process_markets(to_process, priority="SWEEP")
+                # Phase 3: evaluate each instrument with full context
+                all_signals: list[Signal] = []
+                for instrument, data in instrument_data.items():
+                    data["features"].update(cross_features)
+                    signals = self._evaluate_instrument(data)
+                    all_signals.extend(signals)
 
-                        self._last_full_sweep = now
+                if not all_signals:
+                    logger.info("[Bot] No signals this cycle")
+                else:
+                    await self._process_signals(all_signals)
 
-                except Exception as e:
-                    logger.error(f"[Loop] Cycle error: {e}", exc_info=True)
+            except Exception as e:
+                logger.error(f"[Bot] Cycle error: {e}", exc_info=True)
 
-                # ── Sleep until next cycle ────────────────────────────────────
-                elapsed = (datetime.utcnow() - cycle_start).total_seconds()
-                sleep_time = max(1, config.bot.scan_interval_seconds - elapsed)
-                logger.info(f"[Loop] Cycle done in {elapsed:.1f}s — sleeping {sleep_time:.0f}s")
-                await asyncio.sleep(sleep_time)
+            elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
+            sleep_time = max(10, 300 - elapsed)
+            logger.info(f"[Bot] Cycle done in {elapsed:.1f}s — sleeping {sleep_time:.0f}s")
+            await asyncio.sleep(sleep_time)
 
-    # ─── Per-market pipeline ──────────────────────────────────────────────────
+    # ── Data fetching ─────────────────────────────────────────────────────────
 
-    async def _process_markets(self, markets: list, priority: str):
-        """
-        Run the full pipeline on a list of markets:
-        news enrichment → LLM forecast → edge calculation → execution
-        """
-        signals: list[TradeSignal] = []
+    async def _fetch_instrument_data(self, instrument: str) -> dict | None:
+        """Fetch H1 + H4 candles, compute indicators and features."""
+        timeframes = config.strategy.trend_timeframes
+        primary_tf = timeframes[0] if timeframes else "H1"
 
-        # Step 1: Enrich with news (batch, concurrent)
-        logger.info(f"[Pipeline] Enriching {len(markets)} markets with news...")
-        enriched_list: list[EnrichedMarket] = await self.enricher.enrich_batch(markets)
-
-        # Step 1b: ML pre-filter — score each market before any LLM call
-        # Classifier uses gradient boosting on market features (<1ms, free)
-        # Falls back to heuristic rules until model is trained
-        pre_filtered = []
-        ml_skipped = 0
-        for enriched in enriched_list:
-            score = self.market_classifier.predict_mispricing_score(enriched.market)
-            if score >= 0.25:  # 25% chance of mispricing → worth evaluating
-                pre_filtered.append(enriched)
-            else:
-                ml_skipped += 1
-
-        if ml_skipped > 0:
-            logger.info(
-                f"[Pipeline] ML pre-filter: {ml_skipped} markets skipped (low mispricing score), "
-                f"{len(pre_filtered)} proceeding to LLM"
+        try:
+            series = await self.oanda.get_candles(
+                instrument, primary_tf, config.strategy.lookback_bars
             )
+        except Exception as e:
+            logger.warning(f"[Bot] Failed to fetch {instrument} {primary_tf}: {e}")
+            return None
 
-        # Step 2: LLM forecasting (respect API rate limits with semaphore)
-        sem = asyncio.Semaphore(3)  # 3 concurrent LLM calls
-        processed = 0
+        if len(series.candles) < 50:
+            return None
 
-        async def forecast_and_evaluate(enriched: EnrichedMarket):
-            nonlocal processed
-            async with sem:
-                try:
-                    # Get LLM ensemble estimate
-                    ensemble = await self.forecaster.estimate(enriched)
-                    if ensemble is None:
-                        return
+        series = self.features.compute_indicators(series)
+        feat = self.features.extract_features(series)
+        if not feat:
+            return None
 
-                    # Calculate edge and generate signal
-                    signal = self.edge_calc.evaluate(enriched, ensemble)
-                    if signal:
-                        signal.enriched_context = enriched  # Attach for meta-learner
-                        signals.append(signal)
+        # Fetch H4 for higher-timeframe bias
+        htf_bias = 0.0
+        htf_adx = 20.0
+        htf_ma_align = 0.0
+        try:
+            h4_series = await self.oanda.get_candles(instrument, "H4", 200)
+            if len(h4_series.candles) >= 50:
+                h4_series = self.features.compute_indicators(h4_series)
+                h4_feat = self.features.extract_features(h4_series)
+                if h4_feat:
+                    htf_ma_align = h4_feat.get("ma_alignment", 0.0)
+                    htf_adx = h4_feat.get("adx", 20.0)
+                    htf_bias = self._calculate_htf_bias(h4_feat)
+        except Exception as e:
+            logger.debug(f"[Bot] H4 fetch failed for {instrument}: {e}")
 
-                except Exception as e:
-                    logger.warning(f"[Pipeline] Error on '{enriched.market.question[:50]}': {e}")
-                finally:
-                    processed += 1
-                    if processed % 10 == 0:
-                        logger.info(f"[Pipeline] Processed {processed}/{len(enriched_list)} markets...")
+        feat["htf_bias"] = htf_bias
+        feat["htf_adx"] = htf_adx
+        feat["htf_ma_alignment"] = htf_ma_align
 
-        await asyncio.gather(*[forecast_and_evaluate(e) for e in pre_filtered])
+        # Cache for cross-pair computation
+        self._pair_returns[instrument] = feat.get("ret_5", 0.0)
+        self._pair_atr_ratios[instrument] = feat.get("atr_ratio", 1.0)
 
-        # Mark all as processed (even if no signal found — avoid re-evaluating)
-        for m in markets:
-            self._processed_market_ids.add(m.question_id)
-
-        # Limit set size to prevent memory growth
-        if len(self._processed_market_ids) > 5000:
-            # Keep the most recent 3000
-            self._processed_market_ids = set(list(self._processed_market_ids)[-3000:])
-
-        # Step 3: Rank signals, meta-learner gate, adaptive Kelly, execute
-        if not signals:
-            logger.info(f"[Pipeline] {priority}: No edges found in this batch")
-            return
-
-        ranked = EdgeCalculator.rank_signals(signals)
-
-        # Meta-learner final gate: filters out trades where historical patterns
-        # suggest the LLM edge won't hold up, and adjusts Kelly sizing
-        approved: list[TradeSignal] = []
-        for signal in ranked:
-            enriched = signal.enriched_context
-            if enriched is None:
-                approved.append(signal)
-                continue
-            should_trade, reason = self.meta_learner.should_trade(signal, enriched)
-            kelly_mult = self.meta_learner.adjusted_kelly_multiplier(signal, enriched)
-            if should_trade:
-                signal.capped_size_usdc = round(
-                    min(signal.capped_size_usdc * kelly_mult, config.bot.max_trade_size_usdc), 2
-                )
-                signal.expected_value = round(signal.edge_after_fees * signal.capped_size_usdc, 4)
-                approved.append(signal)
-                logger.debug(f"[Meta] ✅ kelly_mult={kelly_mult:.2f} | {reason}")
-            else:
-                logger.debug(f"[Meta] ❌ blocked | {reason}")
-
-        if not approved:
-            logger.info(f"[Pipeline] {priority}: All {len(ranked)} signals blocked by meta-learner")
-            return
-
-        logger.info(
-            f"[Pipeline] {priority}: {len(ranked)} signals → "
-            f"{len(approved)} approved by meta-learner"
+        regime, regime_confidence = self.regime_detector.predict(feat)
+        logger.debug(
+            f"[Bot] {instrument} regime: {regime.value} "
+            f"(conf={regime_confidence:.0%}) HTF_bias={htf_bias:+.2f}"
         )
-        self._print_signals(approved[:5])
 
-        # Execute top approved signals
-        for signal in approved:
-            if len(self.executor.get_open_positions()) >= config.bot.max_open_positions:
-                logger.info("[Pipeline] Max positions reached — stopping execution")
-                break
-            result = self.executor.execute(signal)
-            if result.executed:
-                self.calibration.record_trade(result)
-                # Register with market classifier for training
-                self.market_classifier.add_training_sample(
-                    market=signal.market,
-                    was_mispriced=True,  # We thought so — resolved outcome added later
-                )
+        # Feed regime labeler
+        self._maybe_label_regime(instrument, feat, series)
 
-    def resolve_trade(self, order_id: str, won: bool, pnl: float):
-        """
-        Call this after a market resolves. Feeds outcome back to all ML layers.
-        In production you'd hook this to a Polymarket webhook or poll for resolved markets.
-        """
-        from core.models import MarketOutcome
-        outcome = MarketOutcome.YES if won else MarketOutcome.NO
-        self.calibration.resolve_trade(order_id, outcome, pnl)
+        return {
+            "instrument": instrument,
+            "series": series,
+            "features": feat,
+            "regime": regime,
+        }
 
-        # Find the signal in open positions to feed meta-learner
-        position = self.executor.get_open_positions().get(order_id)
-        if position and position.signal.enriched_context:
-            self.meta_learner.record_outcome(
-                signal=position.signal,
-                enriched=position.signal.enriched_context,
-                won=won,
-                pnl=pnl,
+    @staticmethod
+    def _calculate_htf_bias(h4_feat: dict[str, float]) -> float:
+        """Convert H4 features into a directional bias score (-1 to +1)."""
+        ma_align = h4_feat.get("ma_alignment", 0.0)
+        adx = h4_feat.get("adx", 20.0)
+        ret_20 = h4_feat.get("ret_20", 0.0)
+
+        # ADX must show some directionality for bias to matter
+        if adx < 18:
+            return 0.0
+
+        bias = 0.0
+
+        # MA alignment is the primary signal
+        bias += ma_align * 0.6
+
+        # ADX scales the conviction
+        adx_factor = min(1.0, (adx - 18) / 30)
+        bias *= (0.5 + 0.5 * adx_factor)
+
+        # Recent H4 momentum
+        if ret_20 != 0:
+            momentum_sign = 1.0 if ret_20 > 0 else -1.0
+            bias += momentum_sign * min(0.2, abs(ret_20) * 5.0)
+
+        return round(max(-1.0, min(1.0, bias)), 4)
+
+    # ── Cross-pair features ───────────────────────────────────────────────────
+
+    def _compute_cross_pair_features(self, instrument_data: dict[str, dict]) -> dict[str, float]:
+        """Compute features that require data from multiple instruments."""
+        if len(instrument_data) < 2:
+            return {"usd_strength": 0.0, "market_vol_sync": 1.0}
+
+        # USD strength: average directional move of USD across pairs
+        usd_returns = []
+        for inst, data in instrument_data.items():
+            ret = data["features"].get("ret_5", 0.0)
+            if inst.startswith("USD_"):
+                usd_returns.append(ret)
+            elif inst.endswith("_USD") and inst != "XAU_USD":
+                usd_returns.append(-ret)
+
+        usd_strength = float(np.mean(usd_returns)) if usd_returns else 0.0
+
+        # Market volatility synchronization
+        atr_ratios = [
+            data["features"].get("atr_ratio", 1.0)
+            for data in instrument_data.values()
+        ]
+        market_vol_sync = float(np.mean(atr_ratios)) if atr_ratios else 1.0
+
+        return {
+            "usd_strength": round(usd_strength, 6),
+            "market_vol_sync": round(market_vol_sync, 4),
+        }
+
+    # ── Per-instrument evaluation ────────────────────────────────────────────
+
+    def _evaluate_instrument(self, data: dict) -> list[Signal]:
+        """Run all strategies on pre-computed instrument data."""
+        series = data["series"]
+        feat = data["features"]
+        regime = data["regime"]
+
+        signals: list[Signal] = []
+        for strategy in self.strategies:
+            try:
+                sig = strategy.evaluate(series, feat, regime)
+                if sig:
+                    signals.append(sig)
+            except Exception as e:
+                logger.warning(f"[Bot] Strategy {strategy.name} error: {e}")
+
+        return signals
+
+    # ── Signal processing and execution ──────────────────────────────────────
+
+    async def _process_signals(self, signals: list[Signal]):
+        regime = signals[0].regime if signals else Regime.UNKNOWN
+
+        ranked = self.signal_combiner.rank_signals(signals, regime)
+
+        try:
+            account = await self.oanda.get_account_summary()
+            capital = account.get("nav", config.trading.total_capital)
+        except Exception:
+            capital = config.trading.total_capital
+
+        open_positions = self.executor.get_open_positions()
+
+        executed = 0
+        for signal, score in ranked:
+            should_trade, reason = self.signal_combiner.should_trade(signal, score)
+            if not should_trade:
+                logger.debug(f"[Bot] Signal blocked: {reason}")
+                continue
+
+            allowed, risk_reason = self.risk.check(signal, open_positions, capital)
+            if not allowed:
+                logger.debug(f"[Bot] Risk blocked: {risk_reason}")
+                continue
+
+            perf = self.store.get_performance(strategy=signal.source.value, last_n=50)
+            win_prob = perf.win_rate if perf.total_trades >= 20 else 0.5
+            rr_ratio = (perf.avg_win / abs(perf.avg_loss)) if perf.avg_loss != 0 else 1.5
+
+            size_info = self.sizer.calculate(
+                signal=signal,
+                capital=capital,
+                win_prob=win_prob,
+                avg_win_loss_ratio=rr_ratio,
             )
-            # Feed market classifier too
-            self.market_classifier.add_training_sample(
-                market=position.signal.market,
-                was_mispriced=won,  # If we won, our mispricing call was correct
-                final_price=1.0 if won else 0.0,
+
+            if size_info["units"] == 0:
+                continue
+
+            position = await self.executor.execute(
+                signal=signal,
+                units=size_info["units"],
+                risk_usdc=size_info["risk_usdc"],
             )
-            # Periodically refit classifier
-            if len(self.market_classifier._training_data) % 50 == 0:
-                self.market_classifier.fit()
 
-        logger.info(f"[Bot] Resolved {order_id}: {'WIN' if won else 'LOSS'} ${pnl:+.2f}")
+            if position:
+                executed += 1
+                open_positions[position.trade_id] = position
+                self._print_trade(signal, score, size_info)
 
-    # ─── Display ──────────────────────────────────────────────────────────────
+        if executed > 0:
+            logger.info(f"[Bot] Executed {executed} trade(s) this cycle")
 
-    def _print_signals(self, signals: list[TradeSignal]):
-        if not signals:
+    # ── ML feedback loop ─────────────────────────────────────────────────────
+
+    def _process_closed_trades(self):
+        closed = self.store.get_closed_trades(limit=10)
+        for trade in closed:
+            if trade.get("_ml_processed"):
+                continue
+
+            pnl = trade.get("pnl")
+            if pnl is None:
+                continue
+
+            won = pnl > 0
+            strategy = trade.get("strategy", "unknown")
+            regime_str = trade.get("regime", "unknown")
+
+            try:
+                regime = Regime(regime_str)
+            except ValueError:
+                regime = Regime.UNKNOWN
+
+            signal = Signal(
+                instrument=trade.get("instrument", ""),
+                source=next(
+                    (s for s in [
+                        "trend_following", "mean_reversion", "breakout"
+                    ] if s == strategy),
+                    "trend_following",
+                ),
+                direction=Direction(trade.get("direction", "long")),
+                strength=trade.get("signal_strength", 0.5),
+                confidence=trade.get("signal_confidence", 0.5),
+                regime=regime,
+                features=self._parse_features(trade.get("entry_features", "{}")),
+            )
+
+            self.signal_combiner.record_outcome(signal, won, pnl, regime)
+            self.risk.record_daily_pnl(pnl)
+
+    def _maybe_label_regime(self, instrument: str, features: dict, series):
+        now = datetime.now(timezone.utc)
+        last = self._last_regime_label_time.get(instrument)
+        if last and (now - last).total_seconds() < 7200:
             return
 
-        table = Table(title=f"Top {len(signals)} Signals", border_style="cyan")
-        table.add_column("Market", max_width=45, overflow="fold")
-        table.add_column("Side", style="bold")
-        table.add_column("Market P", justify="right")
-        table.add_column("Our P", justify="right")
-        table.add_column("Edge", justify="right")
-        table.add_column("Size", justify="right")
-        table.add_column("EV", justify="right")
-        table.add_column("Conf", justify="right")
-        table.add_column("New?", justify="center")
+        if len(series.candles) < 40:
+            return
 
-        for s in signals:
-            side_style = "green" if s.side.value == "YES" else "red"
-            table.add_row(
-                s.market.question[:45],
-                f"[{side_style}]{s.side.value}[/{side_style}]",
-                f"{s.market_price:.1%}",
-                f"{s.estimated_probability:.1%}",
-                f"[green]{s.edge_after_fees:.1%}[/green]",
-                f"${s.capped_size_usdc:.2f}",
-                f"${s.expected_value:.2f}",
-                f"{s.ensemble.confidence:.0%}",
-                "✓" if s.market.is_new else "",
+        past_features = self.features.extract_features(
+            type(series)(
+                instrument=series.instrument,
+                timeframe=series.timeframe,
+                candles=series.candles[:-20],
+                sma_20=series.sma_20[:-20] if series.sma_20 else None,
+                sma_50=series.sma_50[:-20] if series.sma_50 else None,
+                sma_200=series.sma_200[:-20] if series.sma_200 else None,
+                ema_12=series.ema_12[:-20] if series.ema_12 else None,
+                ema_26=series.ema_26[:-20] if series.ema_26 else None,
+                rsi_14=series.rsi_14[:-20] if series.rsi_14 else None,
+                macd_line=series.macd_line[:-20] if series.macd_line else None,
+                macd_signal=series.macd_signal[:-20] if series.macd_signal else None,
+                macd_histogram=series.macd_histogram[:-20] if series.macd_histogram else None,
+                bb_upper=series.bb_upper[:-20] if series.bb_upper else None,
+                bb_middle=series.bb_middle[:-20] if series.bb_middle else None,
+                bb_lower=series.bb_lower[:-20] if series.bb_lower else None,
+                atr_14=series.atr_14[:-20] if series.atr_14 else None,
+                adx_14=series.adx_14[:-20] if series.adx_14 else None,
+                donchian_upper=series.donchian_upper[:-20] if series.donchian_upper else None,
+                donchian_lower=series.donchian_lower[:-20] if series.donchian_lower else None,
+                returns=series.returns[:-20] if series.returns else None,
+                volatility_20=series.volatility_20[:-20] if series.volatility_20 else None,
+            )
+        )
+
+        if not past_features:
+            return
+
+        subsequent_closes = [c.close for c in series.candles[-20:]]
+        atr = features.get("atr_ratio", 1.0) * series.closes[-1] * 0.01
+        if series.atr_14:
+            valid_atr = [v for v in series.atr_14[-25:-20] if v is not None]
+            if valid_atr:
+                atr = valid_atr[-1]
+
+        self.regime_detector.label_from_hindsight(past_features, subsequent_closes, atr)
+        self._last_regime_label_time[instrument] = now
+
+    @staticmethod
+    def _parse_features(features_str: str) -> dict[str, float]:
+        try:
+            import json
+            return json.loads(features_str)
+        except Exception:
+            return {}
+
+    # ── Display ──────────────────────────────────────────────────────────────
+
+    def _print_startup(self):
+        mode = "[yellow]PAPER TRADING[/yellow]" if config.trading.dry_run else "[red bold]LIVE[/red bold]"
+        inst_mode = f"[magenta]single: {self._instrument_filter}[/magenta]" if self._instrument_filter else "multi"
+        console.print(Panel.fit(
+            "[bold cyan]Adaptive Forex Trader[/bold cyan]\n"
+            "[dim]Multi-strategy system with ML regime detection[/dim]",
+            border_style="cyan",
+        ))
+        console.print(f"Mode: {mode} | Instrument mode: {inst_mode}")
+        console.print(f"Instruments: [cyan]{', '.join(self._instruments)}[/cyan]")
+        console.print(f"Capital: [cyan]${config.trading.total_capital:,.2f}[/cyan]")
+        console.print(f"Risk per trade: [cyan]{config.trading.max_risk_per_trade:.1%}[/cyan]")
+        console.print(f"Kelly fraction: [cyan]{config.trading.kelly_fraction:.0%}[/cyan]")
+        console.print(f"Strategies: [cyan]{', '.join(s.name for s in self.strategies)}[/cyan]")
+
+        regime_status = self.regime_detector.get_status()
+        if regime_status["is_fitted"]:
+            console.print(f"Regime detector: [green]fitted[/green] (accuracy={regime_status['accuracy']:.1%})")
+        else:
+            console.print(
+                f"Regime detector: [yellow]heuristic[/yellow] "
+                f"(need {regime_status['needs']} more samples)"
             )
 
+        combiner_insights = self.signal_combiner.get_insights()
+        if combiner_insights["is_fitted"]:
+            console.print(f"Signal combiner: [green]fitted[/green] (AUC={combiner_insights['model_auc']:.3f})")
+        else:
+            console.print(
+                f"Signal combiner: [yellow]heuristic[/yellow] "
+                f"({combiner_insights['training_samples']} samples)"
+            )
+
+        perf = self.store.get_performance()
+        if perf.total_trades > 0:
+            console.print(Panel(
+                f"Trades: {perf.total_trades} | "
+                f"Win rate: {perf.win_rate:.1%} | "
+                f"P&L: {'$' if perf.total_pnl >= 0 else '-$'}{abs(perf.total_pnl):.2f} | "
+                f"Sharpe: {perf.sharpe_ratio:.2f} | "
+                f"Max DD: ${perf.max_drawdown:.2f}",
+                title="Historical Performance", border_style="blue",
+            ))
+        console.print()
+
+    def _print_trade(self, signal: Signal, score: float, size_info: dict):
+        table = Table(title="Trade Executed", border_style="green" if signal.direction == Direction.LONG else "red")
+        table.add_column("Field")
+        table.add_column("Value")
+        table.add_row("Instrument", signal.instrument)
+        table.add_row("Direction", signal.direction.value.upper())
+        table.add_row("Strategy", signal.source.value)
+        table.add_row("Signal Score", f"{score:.3f}")
+        table.add_row("Entry", f"{signal.entry_price:.5f}")
+        table.add_row("Stop Loss", f"{signal.stop_loss:.5f}")
+        table.add_row("Take Profit", f"{signal.take_profit:.5f}")
+        table.add_row("Units", f"{abs(size_info['units']):,.0f}")
+        table.add_row("Risk", f"${size_info['risk_usdc']:.2f}")
+        table.add_row("Regime", signal.regime.value)
+        table.add_row("Reasoning", signal.reasoning)
         console.print(table)
 
-        costs = self.forecaster.get_cost_summary()
-        if costs["total_usd"] > 0:
+    def _shutdown(self, *_):
+        logger.info("[Bot] Shutting down...")
+        self._running = False
+
+        perf = self.store.get_performance()
+        if perf.total_trades > 0:
             console.print(Panel(
-                f"Session LLM spend: [cyan]${costs['total_usd']:.4f}[/cyan]\n" +
-                "\n".join(f"  {k}: ${v:.4f} ({costs['calls_by_provider'].get(k,0)} calls)"
-                          for k, v in costs["by_provider"].items() if v > 0) +
-                f"\n{costs['tip']}",
-                title="Cost Tracking", border_style="yellow"
+                f"Total trades: {perf.total_trades}\n"
+                f"Win rate: {perf.win_rate:.1%}\n"
+                f"Total P&L: ${perf.total_pnl:.2f}\n"
+                f"Profit factor: {perf.profit_factor:.2f}\n"
+                f"Sharpe: {perf.sharpe_ratio:.2f}",
+                title="Session Summary", border_style="blue",
             ))
 
-    def _print_stats(self):
-        """Print performance stats from calibration DB."""
-        stats = self.calibration.get_summary()
-        if stats["total_trades"] == 0:
-            console.print("[dim]No previous trade history found.[/dim]\n")
-            return
+        insights = self.signal_combiner.get_insights()
+        if insights.get("strategy_regime_win_rates"):
+            console.print("[bold]Strategy-Regime Win Rates:[/bold]")
+            for key, stats in insights["strategy_regime_win_rates"].items():
+                console.print(f"  {key}: {stats['win_rate']:.1%} ({stats['trades']} trades)")
 
-        panel_text = (
-            f"Total trades: [cyan]{stats['total_trades']}[/cyan] "
-            f"({stats['dry_run_trades']} dry run)\n"
-            f"Resolved: [cyan]{stats['resolved_trades']}[/cyan]\n"
-        )
-        if stats["avg_brier_score"] is not None:
-            panel_text += (
-                f"Avg Brier score: [cyan]{stats['avg_brier_score']:.4f}[/cyan] "
-                f"(0.0=perfect, 0.25=random)\n"
-                f"Win rate: [cyan]{stats['win_rate']:.1%}[/cyan]\n"
-                f"Total P&L: [{'green' if stats['total_pnl_usdc'] >= 0 else 'red'}]"
-                f"${stats['total_pnl_usdc']:.2f}[/]\n"
-            )
-
-        console.print(Panel(panel_text.strip(), title="Historical Performance", border_style="blue"))
-
-    # ─── Shutdown ─────────────────────────────────────────────────────────────
-
-    def _handle_shutdown(self, *_):
-        logger.info("[Bot] Shutdown signal received")
-        self._running = False
-        if not config.bot.dry_run:
-            self.executor.cancel_all_orders()
-        self._print_stats()
         sys.exit(0)
 
 
-# ─── Entry point ──────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
-    import sys
-    sys.path.insert(0, str(__file__).rsplit("/", 2)[0])  # Add project root to path
+    parser = argparse.ArgumentParser(description="Adaptive Forex Trader")
+    parser.add_argument(
+        "--instrument", "-i",
+        help="Run in single-instrument mode (e.g. EUR_USD)",
+    )
+    args = parser.parse_args()
 
-    bot = PolymarketBot()
+    bot = TradingBot(instrument_filter=args.instrument)
     asyncio.run(bot.start())

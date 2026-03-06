@@ -1,0 +1,8 @@
+services:
+  trader:
+    build: .
+    restart: always
+    env_file: .env
+    volumes:
+      - ./logs:/app/logs
+    stop_grace_period: 10s

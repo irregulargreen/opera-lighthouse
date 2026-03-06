@@ -1,21 +1,21 @@
-# Secrets — NEVER commit
+# Environment
 .env
+.env.*
 
-# ML model files (large binaries, machine-specific)
-logs/
-*.pkl
-*.db
-*.sqlite
-*.json
+# Logs and models
+logs/*.db
+logs/*.pkl
+logs/*.json
+logs/*.csv
 
 # Python
 __pycache__/
 *.py[cod]
-*.pyo
-.pytest_cache/
+*$py.class
 *.egg-info/
 dist/
 build/
+*.egg
 
 # Virtual environment
 venv/
@@ -26,6 +26,8 @@ env/
 .vscode/
 .idea/
 *.swp
+*.swo
+*~
 
 # OS
 .DS_Store
